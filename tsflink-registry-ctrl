@@ -1,0 +1,155 @@
+#!/bin/bash
+OSVER=`uname -a`
+if [[ ! "$OSVER" =~ .*Linux.* ]] ; then
+    echo "Only support GNU/Linux!"
+    exit 1
+fi
+PRG="$0"
+
+function print_usage() {
+    echo "Usage: $PRG <COMMAND>"
+    echo "            start - Start services."
+    echo "            stop - Stop services."
+    echo "            help - Print this usage info."
+}
+
+
+CMD=""
+for ARG in "$@"
+do
+    case $ARG in
+        help)
+            print_usage
+            exit 0
+            ;;
+        start)
+            CMD="start"
+            ;;
+        stop)
+            CMD="stop"
+            ;;
+        *)
+            echo "Unknown command $ARG"
+            print_usage
+            exit 1
+    esac
+done
+
+if [ -z "$CMD" ] ; then
+    print_usage
+    exit 1
+fi
+       
+function check_image() {
+    local IMG="$1"
+    local RST=`docker images udiabon/$IMG`
+    if [[ ! "$RST" =~ .*$IMG.* ]] ; then
+        echo "Image 'udiabon/$IMG' not found, pulling from the official registry ..."
+        docker pull udiabon/$IMG
+        if [ "0" -ne "$?" ] ; then
+            echo "Pull image '$IMG' fail!"
+            exit 1
+        fi
+    fi
+}
+
+check_image "docker-registry-v1-tsflink"
+check_image "docker-registry-v2-tsflink"
+check_image "docker-registry-nginx-tsflink"
+
+WORKDIR=`mktemp -d /tmp/cn_tsflink_reg_compose.XXXXX` || (echo "Create build directory fail!" && exit 1)
+cd "$WORKDIR"
+
+[ "$UID" -eq "0" ] || (echo "Only root could run this program!" && exit 1)
+
+USERID=`id docker-registry > /dev/null 2>&1`
+EUSERHOME="/home/docker-registry"
+
+function missing_ssl_cert() {
+    echo "Please deploy the SSL Certificate into the directory"\
+        "'$EUSERHOME/nginx/certs' and rerun this program."
+    echo "The base name of the certificate should be"\
+        "'registry_docker_365link_cn'"
+    exit 1
+}
+
+function ensure_dirs() {
+    su docker-registry -c "mkdir -p $EUSERHOME/nginx/certs && \
+        mkdir -p $EUSERHOME/nginx/log && \
+        mkdir -p $EUSERHOME/data/v1 && \
+        mkdir -p $EUSERHOME/data/v2"
+}
+
+if [ "0" -ne "$?" ] ; then
+    echo "Creating the user 'docker-registry' ..."
+    adduser docker-registry
+    if [ "0" -ne "$?" ] ; then
+        echo "Can not create user 'docker-registry'"
+        exit 1
+    fi
+    ensure_dirs
+    missing_ssl_cert
+fi
+ensure_dirs
+
+if [ ! -f "$EUSERHOME/nginx/certs/registry_docker_365link_cn.crt" ] ; then
+    missing_ssl_cert
+fi
+if [ ! -f "$EUSERHOME/nginx/certs/registry_docker_365link_cn.key" ] ; then
+    missing_ssl_cert
+fi
+
+cat > docker-compose.yml <<EOF
+nginx:
+  image: udiabon/docker-registry-nginx-tsflink
+  name: registry-nginx-tsflink
+  restart: on-failure:16
+  volumes:
+    - $EUSERHOME/nginx/certs:/etc/nginx/certs
+    - $EUSERHOME/nginx/log:/var/log/nginx
+  ports:
+    - "5000:5000"
+  links:
+    - registryv1:registryv1
+    - registryv2:registryv2
+registryv1:
+  image: udiabon/docker-registry-v1-tsflink
+  name: registry-v1-tsflink
+  restart: on-failure:16
+  volumes:
+    - $EUSERHOME/data/v1:/data
+  ports:
+    - "5000"
+registryv2:
+  image: udiabon/docker-registry-v2-tsflink
+  name: registry-v2-tsflink 
+  restart: on-failure:16
+  volumes:
+    - $EUSERHOME/data/v2:/data
+  ports:
+    - "5000"
+EOF
+
+function stop_container() {
+    local IMG="$1"
+    local IMGRE="udiabon\/$IMG:latest"
+    local IMGID=`docker ps | grep -e "$IMGRE" | awk '{print $1}'`
+    if [ -n "$IMGID" ] ; then
+        docker stop $IMGID
+    else
+        echo "Not found running container of the image udiabon/$IMG:latest" >&2
+    fi
+}
+
+if [ "start" == "$CMD" ] ; then
+    echo "Starting services ..."
+    docker-compose up -d
+else
+    echo "Stopping services ..."
+    stop_container "docker-registry-nginx-tsflink"
+    stop_container "docker-registry-v1-tsflink"
+    stop_container "docker-registry-v2-tsflink"
+fi
+
+rm -fr "$WORKDIR"
+
